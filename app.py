@@ -179,7 +179,7 @@ if uploaded_file is not None:
     # Remember the click so the dashboard survives reruns caused by the AI chat input.
     if st.sidebar.button("Show Analysis", type="primary", use_container_width=True):
         st.session_state["show_analysis"] = True
-    st.sidebar.caption(f"{len(user_list) - 1} participants · {int(df['date'].notna().sum()):,} messages")
+    st.sidebar.caption(f"{len(user_list) - 1} participants · {int(df['date'].notna().sum()):,} messages · v{config.APP_VERSION}")
 
     tab_dashboard, tab_ai = st.tabs(["📊 Analysis Dashboard", "🤖 AI Chat Assistant"])
 
