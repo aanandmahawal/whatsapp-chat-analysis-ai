@@ -1,6 +1,28 @@
 import re
 import pandas as pd
 
+
+def _parse_dates(date_strings, date_format):
+    """
+    WhatsApp writes dates as DD/MM/YY or MM/DD/YY depending on the phone's
+    locale (India -> day-first, US English -> month-first). The export gives no
+    hint which one it is, so try both and keep the order that parses cleanly.
+    Tie-break: a chat export is chronological, so prefer the order whose
+    timestamps never go backwards.
+    """
+    # Normalise the narrow no-break space some phones put before AM/PM.
+    s = date_strings.astype(str).str.replace('\u202f', ' ', regex=False).str.replace('\u00a0', ' ', regex=False)
+    day_first = pd.to_datetime(s, format=date_format, errors='coerce')
+    month_first = pd.to_datetime(s, format=date_format.replace('%d/%m', '%m/%d'), errors='coerce')
+
+    def score(parsed):
+        valid = parsed.dropna()
+        backwards = int((valid.diff() < pd.Timedelta(0)).sum()) if len(valid) > 1 else 0
+        return (int(parsed.isna().sum()), backwards)   # lower is better on both
+
+    return month_first if score(month_first) < score(day_first) else day_first
+
+
 def preprocess(data):
     # Try matching both formats
     pattern_12hr = r'\d{1,2}/\d{1,2}/\d{2}, \d{1,2}:\d{2}[\u2000-\u206F\s]*[AaPp][Mm] - '
@@ -26,7 +48,7 @@ def preprocess(data):
 
     # Create DataFrame
     df = pd.DataFrame({'user_message': message_list, 'message_date': date_list})
-    df['message_date'] = pd.to_datetime(df['message_date'], format=date_format, errors='coerce')
+    df['message_date'] = _parse_dates(df['message_date'], date_format)
     df.rename(columns={'message_date': 'date'}, inplace=True)
 
     # Separate users and messages
