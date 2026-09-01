@@ -120,6 +120,10 @@ if uploaded_file is not None:
     if load_error:
         st.error(load_error)
         st.stop()
+    unparsed = int(df["date"].isna().sum())
+    if unparsed:
+        st.warning(f"{unparsed} of {len(df)} messages have timestamps that could not be parsed and will be "
+                   "ignored by the AI assistant. The export may mix date formats.")
 
     user_list = df['user'].unique().tolist()
     if 'group_notification' in user_list:   # a 1-to-1 chat may have no system messages
