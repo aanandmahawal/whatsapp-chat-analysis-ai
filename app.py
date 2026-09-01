@@ -43,6 +43,20 @@ st.markdown("""
             font-size: 1rem;
             color: #003366;
         }
+
+        /* --- AI Chat Assistant tab --- */
+        .ai-title {
+            font-size: 1.9rem; font-weight: 700; color: #a259c4;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0.4rem 0 0.2rem 0;
+        }
+        .ai-subtitle { font-size: 0.95rem; opacity: 0.8; margin-bottom: 0.9rem; }
+        .ai-examples-label { font-size: 0.85rem; opacity: 0.7; margin: 0.4rem 0 0.2rem 0; }
+        .ai-empty {
+            text-align: center; opacity: 0.6; padding: 2rem 0 1rem 0; font-style: italic;
+        }
+        [data-testid="stChatMessage"] { border-radius: 12px; padding: 0.6rem 0.9rem; margin-bottom: 0.4rem; }
+        [data-testid="stChatMessage"] pre { font-size: 0.78rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -258,58 +272,78 @@ if uploaded_file is not None:
     # AI Chat Assistant
     # =====================================================================
     with tab_ai:
-        styled_heading("AI Chat Assistant", "purple", is_first=True)
-        st.caption("Ask anything about your WhatsApp conversation. Answers are computed from the uploaded chat, "
-                   "not guessed. Only the question and the small computed result are sent to the LLM.")
-
-        # Reset the conversation whenever a different file is uploaded.
+        # -- state: reset the conversation whenever a different file is uploaded
         file_hash = hashlib.sha256(bytes_data).hexdigest()
         if st.session_state.get("ai_file_hash") != file_hash:
             st.session_state["ai_file_hash"] = file_hash
             st.session_state["ai_messages"] = []
+        messages = st.session_state["ai_messages"]
+
+        # -- header row: title + actions
+        head_col, act_col = st.columns([4, 1.4])
+        with head_col:
+            st.markdown("<div class='ai-title'>🤖 AI Chat Assistant</div>"
+                        "<div class='ai-subtitle'>Ask anything about this chat. Every number and quote is computed "
+                        "from the uploaded file — only the question and the small result go to the LLM.</div>",
+                        unsafe_allow_html=True)
+        with act_col:
+            if messages:
+                transcript = "\n\n".join(f"{'You' if m['role']=='user' else 'AI'}: {m['content']}" for m in messages)
+                st.download_button("⬇️ Save chat", transcript, file_name="ai_chat_history.txt",
+                                   use_container_width=True)
+                if st.button("🗑️ Clear chat", use_container_width=True):
+                    st.session_state["ai_messages"] = []
+                    st.rerun()
 
         api_key = config.get_api_key()
         if not api_key:
-            st.warning(
-                "**GROQ_API_KEY is not set.** Add it to a local `.env` file "
-                "(`GROQ_API_KEY=gsk_...`) or to Streamlit secrets, then restart the app. "
-                "See README.md for details."
-            )
+            st.warning("**GROQ_API_KEY is not set.** Add it to a local `.env` file (`GROQ_API_KEY=gsk_...`) "
+                       "or to Streamlit secrets, then restart the app. See README.md.")
             st.stop()
-
         try:
             tools = build_ai_resources(file_hash, df)
         except ToolError as e:
             st.error(str(e))
             st.stop()
-
         if tools.index is None:
             st.info("This chat is very large, so topic/semantic questions are disabled; "
                     "counts, rankings and keyword search still work.")
 
-        # ---- example questions ------------------------------------------
+        # -- example questions (one row of pills; falls back to buttons on old Streamlit)
         examples = [
-            "Who is the most active user?",
-            "What was the busiest day?",
-            "What is this group mainly about?",
-            "What time is this group most active?",
+            "Who is the most active user?", "What was the busiest day?", "What is this chat mainly about?",
+            "What time is this chat most active?", "Who shares more media?", "What was the first message?",
         ]
-        cols = st.columns(len(examples))
-        for col, q in zip(cols, examples):
-            if col.button(q, use_container_width=True, key=f"ex_{q}"):
-                st.session_state["ai_pending"] = q
 
-        # ---- conversation so far ----------------------------------------
-        for m in st.session_state["ai_messages"]:
-            with st.chat_message(m["role"]):
+        def _pick_example():
+            st.session_state["ai_pending"] = st.session_state.get("ai_example")
+            st.session_state["ai_example"] = None      # allow the same pill to be clicked again later
+
+        st.markdown("<div class='ai-examples-label'>Try one of these</div>", unsafe_allow_html=True)
+        if hasattr(st, "pills"):
+            st.pills("examples", examples, key="ai_example", on_change=_pick_example,
+                     label_visibility="collapsed")
+        else:
+            for row in (examples[:3], examples[3:]):
+                for col, q in zip(st.columns(3), row):
+                    if col.button(q, use_container_width=True, key=f"ex_{q}"):
+                        st.session_state["ai_pending"] = q
+
+        # -- conversation (always rendered from session state, oldest -> newest)
+        if not messages:
+            st.markdown("<div class='ai-empty'>No questions yet. Pick an example above or type below.</div>",
+                        unsafe_allow_html=True)
+        for i, m in enumerate(messages):
+            with st.chat_message(m["role"], avatar="🧑" if m["role"] == "user" else "🤖"):
                 st.markdown(m["content"])
                 if m.get("trace"):
                     with st.expander("How was this computed?"):
                         for step in m["trace"]:
-                            st.markdown(f"**{step['tool']}**  `{step['input']}`")
+                            st.markdown(f"**{step['tool']}** `{step['input']}`")
                             st.code(step["output"][:1500], language="json")
+        pending_slot = st.container()   # the in-progress answer renders here, in flow
 
-        # ---- new question -------------------------------------------------
+        # -- input
         typed = st.chat_input("Ask a question about this chat…")
         question = (typed or st.session_state.pop("ai_pending", None) or "").strip()
 
@@ -317,26 +351,16 @@ if uploaded_file is not None:
             if len(question) > 1000:
                 st.warning("Please keep questions under 1000 characters.")
                 st.stop()
-            history = [{"role": m["role"], "content": m["content"]} for m in st.session_state["ai_messages"]]
-            st.session_state["ai_messages"].append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
-            with st.chat_message("assistant"):
-                with st.spinner("Analysing…"):
-                    try:
-                        agent = ChatAgent(tools, api_key=api_key)
-                        answer, trace = agent.ask(question, history)
-                    except Exception as e:  # API/network/rate-limit errors -> friendly text, never a crash
-                        answer, trace = friendly_api_error(e), []
-                st.markdown(answer)
-                if trace:
-                    with st.expander("How was this computed?"):
-                        for step in trace:
-                            st.markdown(f"**{step['tool']}**  `{step['input']}`")
-                            st.code(step["output"][:1500], language="json")
-            st.session_state["ai_messages"].append({"role": "assistant", "content": answer, "trace": trace})
-
-        if st.session_state["ai_messages"]:
-            if st.button("🗑️ Clear conversation"):
-                st.session_state["ai_messages"] = []
-                st.rerun()
+            history = [{"role": m["role"], "content": m["content"]} for m in messages]
+            with pending_slot:
+                with st.chat_message("user", avatar="🧑"):
+                    st.markdown(question)
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("Analysing the chat…"):
+                        try:
+                            answer, trace = ChatAgent(tools, api_key=api_key).ask(question, history)
+                        except Exception as e:      # API / network / rate-limit -> friendly text, never a crash
+                            answer, trace = friendly_api_error(e), []
+            messages.append({"role": "user", "content": question})
+            messages.append({"role": "assistant", "content": answer, "trace": trace})
+            st.rerun()   # redraw everything from state so the new pair sits in the conversation flow
