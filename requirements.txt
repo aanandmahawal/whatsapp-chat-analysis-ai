@@ -1,0 +1,13 @@
+# --- existing dashboard ---
+streamlit
+matplotlib
+seaborn
+urlextract
+wordcloud
+pandas
+emoji
+
+# --- AI Chat Assistant ---
+groq>=0.20          # official Groq SDK (LLM + tool calling)
+scikit-learn        # TF-IDF vectoriser + cosine similarity for semantic_search / get_topic_overview
+python-dotenv       # loads GROQ_API_KEY from a local .env file (not needed on Streamlit Cloud)

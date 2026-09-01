@@ -1,0 +1,12 @@
+# Ignore virtual environment folder
+venv37fixed/
+
+# Ignore Python bytecode and cache
+__pycache__/
+*.py[cod]
+
+
+
+# AI assistant secrets — never commit these
+.env
+.streamlit/secrets.toml
