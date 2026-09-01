@@ -501,21 +501,24 @@ class ChatTools:
             ],
         }
 
-    def get_topic_overview(self, sample_size: int = 60) -> dict:
-        """Evidence pack for 'what is this group about?': distinctive terms + representative messages."""
+    def get_topic_overview(self, sample_size: int = config.TOPIC_SAMPLE_SIZE) -> dict:
+        """Evidence pack for 'what is this group about?': distinctive terms + representative messages.
+        Kept small on purpose: this result is sent to the LLM in one request."""
         if self.index is None or self.index.size == 0:
             raise ToolError("Topic overview needs text messages to analyse; this chat has none indexed.")
-        sample_ids = self.index.representative_sample(min(int(sample_size), 150))
+        sample_ids = self.index.representative_sample(min(int(sample_size), 60))
         stats = self.get_chat_statistics()
         sample = self._chrono(self.df.loc[sample_ids])
+        rows = []
+        for _, r in sample.iterrows():
+            text = r["text"][: config.TOPIC_MESSAGE_CHARS] + ("…" if len(r["text"]) > config.TOPIC_MESSAGE_CHARS else "")
+            rows.append(f"{r['date'].strftime('%Y-%m-%d')} {r['user']}: {text}")
         return {
             "chat_statistics": {k: stats[k] for k in ("total_messages", "total_users", "first_message_date", "last_message_date")},
-            "distinctive_terms": self.index.top_terms(30),
-            "most_common_words": self._common_words(self.df, 20),
-            "top_emojis": self._emoji_counter(self.df).most_common(8),
-            "representative_messages": self._rows(sample),
-            "note": "The sample is spread across the whole time range and favours longer text messages. "
-                    "Base the topic judgement on this evidence only and say so if it is thin or mixed.",
+            "distinctive_terms": [t for t, _ in self.index.top_terms(15)],
+            "top_emojis": [e for e, _ in self._emoji_counter(self.df).most_common(6)],
+            "representative_messages": rows,
+            "note": "Sample spread across the whole time range. Judge the topic from this evidence only; say if it is thin or mixed.",
         }
 
     # ---- time analysis ---------------------------------------------------
@@ -605,9 +608,9 @@ class ChatTools:
 # Descriptions matter: they are how the LLM decides which tool fits a question.
 # ---------------------------------------------------------------------------
 
-_USER = {"type": "string", "description": "Exact or partial participant name. Omit for the whole chat."}
-_DATE = {"type": "string", "description": "Date in YYYY-MM-DD format."}
-_LIMIT = {"type": "integer", "description": "Max rows to return (default 20, max 100)."}
+_USER = {"type": "string", "description": "Participant name; omit for whole chat"}
+_DATE = {"type": "string", "description": "YYYY-MM-DD"}
+_LIMIT = {"type": "integer", "description": "Max rows"}
 
 
 def _tool(name: str, description: str, properties: dict, required: Optional[list] = None) -> dict:
@@ -621,84 +624,62 @@ def _tool(name: str, description: str, properties: dict, required: Optional[list
     }
 
 
+# Descriptions are deliberately short: every tool definition is re-sent on every API call,
+# and Groq's free tier allows only ~8k tokens per minute.
 TOOL_SPECS: list[dict] = [
     _tool("get_chat_statistics",
-          "Overall totals: messages, users (with counts), words, media, links, deleted messages, date range, active days. "
-          "Use for 'summary of this group', 'how many messages/users', or to check the spelling of a participant's name.",
+          "Totals: messages, users+counts, words, media, links, date range, active days. For 'summary', "
+          "'how many users/messages', or to check a name.",
           {}),
     _tool("get_user_statistics",
-          "Full profile of ONE user: message count, % of total, rank, words, media, links, emojis, first & last message, "
-          "top words/emojis, busiest weekday/month/hour. Call it twice (once per user) to compare two users.",
+          "One user's profile: count, %, rank, words, media, links, emojis, first/last message, top words, "
+          "busiest weekday/month/hour. Call twice to compare two users.",
           {"user": _USER}, ["user"]),
     _tool("get_most_active_users",
-          "Ranking of participants. by='messages' (most active / who talks most / who sent most), "
-          "'words', 'media' (who shared most media), 'links' (who shared most links), 'emojis' (who uses most emojis).",
+          "Rank users by messages (most active/talks most), words, media (most media), links, or emojis.",
           {"limit": _LIMIT, "by": {"type": "string", "enum": ["messages", "words", "media", "links", "emojis"]}}),
     _tool("count_messages",
-          "Exact count of messages matching filters, plus per-user breakdown when no user is given. Filters: user, date range, "
-          "year, month (name or number), weekday (day_name), hour range (start_hour inclusive, end_hour exclusive, 24 = midnight), keyword. "
-          "Answers 'how many messages did X send in March', 'who sent most messages on Sundays', 'messages between 10 PM and midnight' "
-          "(start_hour=22, end_hour=24), 'who was most active in a period'.",
+          "Exact count with filters (user, dates, year, month, weekday, hour range, keyword) + per-user breakdown. "
+          "E.g. 'messages by X in March', 'who sent most on Sundays', '10 PM-midnight' = start_hour 22, end_hour 24.",
           {"user": _USER, "start_date": _DATE, "end_date": _DATE, "year": {"type": "integer"},
-           "month": {"type": "string", "description": "Month name or number 1-12."},
-           "day_name": {"type": "string", "description": "Weekday name, e.g. Sunday."},
-           "start_hour": {"type": "integer", "description": "0-23, inclusive."},
-           "end_hour": {"type": "integer", "description": "1-24, exclusive (24 = midnight)."},
-           "keyword": {"type": "string", "description": "Only count messages containing this text."},
-           "include_media": {"type": "boolean"}}),
+           "month": {"type": "string", "description": "Name or 1-12"},
+           "day_name": {"type": "string", "description": "e.g. Sunday"},
+           "start_hour": {"type": "integer", "description": "0-23 inclusive"},
+           "end_hour": {"type": "integer", "description": "1-24 exclusive"},
+           "keyword": {"type": "string"}}),
     _tool("get_nth_message",
-          "The Nth message in chronological order, 1-based. n=1 -> first message; from_end=true, n=1 -> last/latest message; "
-          "n=3 -> third message. Give user for one person's messages, omit for the whole chat. Exact positional lookup; never guess this.",
-          {"n": {"type": "integer", "description": "1-based position (default 1)."}, "user": _USER,
-           "from_end": {"type": "boolean", "description": "Count from the most recent message instead (default false)."},
-           "include_media": {"type": "boolean", "description": "Count media messages as messages (default true)."}}),
+          "Nth message in time order (1-based). n=1 first; from_end=true n=1 last, n=2 second-last. "
+          "Optional user. Exact lookup - never guess.",
+          {"n": {"type": "integer"}, "user": _USER, "from_end": {"type": "boolean"},
+           "include_media": {"type": "boolean"}}),
     _tool("get_messages",
-          "List messages in order, optionally for one user and/or a date range. Use offset for paging ('next 20'), "
-          "newest_first=true for the most recent, sort_by='longest' for the longest message(s). "
-          "Answers 'show X's first 5 messages', 'what happened on/around DATE', 'longest message'.",
+          "List messages in order for a user and/or date range; offset pages; newest_first for latest; "
+          "sort_by='longest' for longest message. For 'first 5 messages of X', 'what happened on DATE'.",
           {"user": _USER, "start_date": _DATE, "end_date": _DATE, "limit": _LIMIT,
            "offset": {"type": "integer"}, "newest_first": {"type": "boolean"},
-           "sort_by": {"type": "string", "enum": ["chronological", "longest"]},
-           "include_media": {"type": "boolean"}}),
+           "sort_by": {"type": "string", "enum": ["chronological", "longest"]}}),
     _tool("get_message_context",
-          "Messages immediately before and after a given message_id, to read the surrounding conversation.",
-          {"message_id": {"type": "integer"}, "before": {"type": "integer"}, "after": {"type": "integer"}},
-          ["message_id"]),
+          "Messages just before/after a message_id.",
+          {"message_id": {"type": "integer"}}, ["message_id"]),
     _tool("search_messages",
-          "Exact keyword / substring search (case-insensitive). Best when the user gives a specific word, phrase, name or URL fragment. "
-          "Returns matches with message_id, date and sender.",
-          {"keyword": {"type": "string"}, "user": _USER, "limit": _LIMIT, "start_date": _DATE, "end_date": _DATE},
-          ["keyword"]),
+          "Case-insensitive substring search for a specific word/phrase/URL.",
+          {"keyword": {"type": "string"}, "user": _USER, "limit": _LIMIT}, ["keyword"]),
     _tool("semantic_search",
-          "Meaning-based search for a topic or theme ('discussions about internships', 'what did X say about the project'). "
-          "Finds related messages even when the exact word differs. Use for 'summarize conversations about Y' and 'find messages related to Z'; "
-          "follow with get_message_context on interesting message_ids to read full conversations.",
-          {"query": {"type": "string", "description": "Short natural-language description of the topic."},
-           "user": _USER, "limit": _LIMIT, "start_date": _DATE, "end_date": _DATE},
-          ["query"]),
+          "Meaning-based search for a topic ('discussions about internships', 'what did X say about Y'). "
+          "Use for summarise/find-related questions.",
+          {"query": {"type": "string"}, "user": _USER, "limit": _LIMIT}, ["query"]),
     _tool("get_topic_overview",
-          "Evidence pack for 'what is this group about / which field / main topics / kind of conversations / interesting insights': "
-          "distinctive terms, common words, top emojis and a time-spread sample of representative messages. "
-          "Optionally follow with semantic_search on 1-3 candidate topics for more evidence.",
-          {"sample_size": {"type": "integer", "description": "Default 60, max 150."}}),
+          "Evidence for 'what is this chat about / which field / main topics / insights': distinctive terms, "
+          "top emojis, sample of representative messages.",
+          {}),
     _tool("get_activity_breakdown",
-          "Message counts by 'weekday' (which day of the week is busiest), 'date' (busiest single day), 'month', 'month_year', 'year' "
-          "or 'hour' (what time is the group most active), sorted busiest-first, optionally for one user or date range.",
+          "Counts by weekday, date (busiest day), month, month_year, year or hour (busiest time), busiest first.",
           {"dimension": {"type": "string", "enum": ["weekday", "date", "month", "month_year", "year", "hour"]},
-           "user": _USER, "limit": _LIMIT, "start_date": _DATE, "end_date": _DATE},
-          ["dimension"]),
-    _tool("get_most_common_words",
-          "Most frequently used words (stop-words removed) for the whole chat or one user.",
-          {"user": _USER, "limit": _LIMIT}),
-    _tool("get_emoji_statistics",
-          "Emoji usage: total, most frequent emojis, and emojis per user (who uses the most emojis).",
-          {"user": _USER, "limit": _LIMIT}),
-    _tool("get_link_statistics",
-          "Links shared: totals, links per user (who shared most links), top domains, recent link messages.",
-          {"user": _USER, "limit": _LIMIT}),
-    _tool("get_media_statistics",
-          "Media (photos/videos/audio/documents) shared: totals, per user (who sent most media), by month.",
-          {"user": _USER}),
+           "user": _USER, "limit": _LIMIT}, ["dimension"]),
+    _tool("get_most_common_words", "Most used words (stop-words removed).", {"user": _USER, "limit": _LIMIT}),
+    _tool("get_emoji_statistics", "Emoji totals, top emojis, emojis per user.", {"user": _USER, "limit": _LIMIT}),
+    _tool("get_link_statistics", "Links: totals, per user, top domains.", {"user": _USER, "limit": _LIMIT}),
+    _tool("get_media_statistics", "Media: totals, per user, by month.", {"user": _USER}),
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOL_SPECS}
