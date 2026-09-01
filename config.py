@@ -28,6 +28,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Shown in the sidebar so you can confirm which build is running after an update.
+APP_VERSION = "2.3"
+
 # ---------------------------------------------------------------------------
 # Groq LLM
 # ---------------------------------------------------------------------------
@@ -41,7 +44,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.2"))
 
 # Max tokens Groq may generate per call (the answer, not the tool results).
-MAX_COMPLETION_TOKENS = _env_int("GROQ_MAX_COMPLETION_TOKENS", 1500)
+MAX_COMPLETION_TOKENS = _env_int("GROQ_MAX_COMPLETION_TOKENS", 1200)
+
+# Smaller output budget used when retrying after a 413 (request too large).
+RETRY_COMPLETION_TOKENS = _env_int("GROQ_RETRY_COMPLETION_TOKENS", 600)
 
 # How many "think -> call tool -> read result" rounds one question may take.
 # Most questions need 1-2; topic/summary questions may need 3-5.
@@ -49,7 +55,13 @@ MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 8)
 
 # How many previous chat turns (user + assistant messages) are sent back so
 # follow-ups like "how many messages did he send?" work.
-MAX_HISTORY_MESSAGES = _env_int("MAX_HISTORY_MESSAGES", 12)
+MAX_HISTORY_MESSAGES = _env_int("MAX_HISTORY_MESSAGES", 6)
+
+# Each stored history message is truncated to this many characters before being re-sent.
+MAX_HISTORY_CHARS = _env_int("MAX_HISTORY_CHARS", 600)
+
+# If Groq answers 429 with "try again in Ns" and N is at most this, wait and retry once automatically.
+AUTO_RETRY_WAIT_SECONDS = _env_int("AUTO_RETRY_WAIT_SECONDS", 20)
 
 
 def get_api_key() -> str | None:
@@ -72,22 +84,28 @@ def get_api_key() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Tool output limits (keep every tool result small enough for the context)
+# Tool output limits. These are tuned for Groq's FREE tier (8,000 tokens per minute):
+# every API call re-sends the system prompt + tool definitions (~1.8k tokens), so tool
+# results must stay small. On a paid tier you can raise them freely.
 # ---------------------------------------------------------------------------
 
 # Individual messages longer than this are truncated inside tool results.
-MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 400)
+MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 220)
 
 # Hard cap on the size of any single tool result sent to the LLM (characters).
-MAX_TOOL_RESULT_CHARS = _env_int("MAX_TOOL_RESULT_CHARS", 14000)
+MAX_TOOL_RESULT_CHARS = _env_int("MAX_TOOL_RESULT_CHARS", 6000)
 
 # Default and maximum number of rows a list-type tool may return.
-DEFAULT_LIST_LIMIT = _env_int("DEFAULT_LIST_LIMIT", 20)
+DEFAULT_LIST_LIMIT = _env_int("DEFAULT_LIST_LIMIT", 15)
 MAX_LIST_LIMIT = _env_int("MAX_LIST_LIMIT", 100)
 
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
+
+# get_topic_overview: how many sample messages to send, and max characters per message.
+TOPIC_SAMPLE_SIZE = _env_int("TOPIC_SAMPLE_SIZE", 30)
+TOPIC_MESSAGE_CHARS = _env_int("TOPIC_MESSAGE_CHARS", 120)
 
 # Path to the Hinglish stop-word list that already ships with the project.
 STOPWORDS_PATH = os.getenv("STOPWORDS_PATH", "stop_hinglish.txt")
