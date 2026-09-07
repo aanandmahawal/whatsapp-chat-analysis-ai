@@ -7,7 +7,7 @@ import seaborn as sns
 
 import config
 from ai_tools import ChatTools, ToolError
-from ai_agent import ChatAgent, friendly_api_error
+from ai_agent import ChatAgent, FullChatConsentRequired, friendly_api_error
 from retrieval import MessageIndex
 
 # ---------------------------------------------------------------------------
@@ -300,6 +300,10 @@ if uploaded_file is not None:
         if st.session_state.get("ai_file_hash") != file_hash:
             st.session_state["ai_file_hash"] = file_hash
             st.session_state["ai_messages"] = []
+            # Full-chat consent is PER FILE: None = never asked, True = the
+            # user allowed sending the whole transcript, False = they refused.
+            st.session_state["ai_full_chat_consent"] = None
+            st.session_state["ai_awaiting_full_chat"] = None
         messages = st.session_state["ai_messages"]
 
         # -- header row: title + actions
@@ -307,7 +311,8 @@ if uploaded_file is not None:
         with head_col:
             st.markdown("<div class='ai-title'>🤖 AI Chat Assistant</div>"
                         "<div class='ai-subtitle'>Ask anything about this chat. Every number and quote is computed "
-                        "from the uploaded file — only the question and the small result go to the LLM.</div>",
+                        "from the uploaded file — only the question and the small result go to the LLM. "
+                        "If a question truly needs the whole chat, you are asked for permission first.</div>",
                         unsafe_allow_html=True)
         with act_col:
             if messages:
@@ -316,6 +321,10 @@ if uploaded_file is not None:
                                    use_container_width=True)
                 if st.button("🗑️ Clear chat", use_container_width=True):
                     st.session_state["ai_messages"] = []
+                    st.rerun()
+            if st.session_state.get("ai_full_chat_consent") is False:
+                if st.button("🔓 Allow full-chat questions", use_container_width=True):
+                    st.session_state["ai_full_chat_consent"] = True
                     st.rerun()
 
         api_key = config.get_api_key()
@@ -368,6 +377,40 @@ if uploaded_file is not None:
                             st.code(step["output"][:1500], language="json")
         pending_slot = st.container()   # the in-progress answer renders here, in flow
 
+        # -- full-chat consent card: shown when the AI decided a question needs
+        #    the WHOLE transcript and the user has not answered yet.
+        awaiting = st.session_state.get("ai_awaiting_full_chat")
+        if awaiting:
+            with st.container(border=True):
+                st.markdown("#### 🔐 Permission needed")
+                st.markdown(
+                    f"Your question — *“{awaiting['question']}”* — can only be answered by "
+                    f"sending the **entire chat transcript** to the AI model "
+                    f"({'because ' + awaiting['reason'] if awaiting.get('reason') else ''}). "
+                    "Normally only tiny computed results leave this app. "
+                    "Are you willing to send the full chat file to the LLM?")
+                st.caption("Reading the whole chat happens in parts and can take a few minutes "
+                           "on the free tier. Your choice is remembered for this file.")
+                c_yes, c_no = st.columns(2)
+                if c_yes.button("✅ Yes, send the full chat", use_container_width=True, type="primary"):
+                    st.session_state["ai_full_chat_consent"] = True
+                    st.session_state["ai_pending"] = awaiting["question"]
+                    st.session_state["ai_awaiting_full_chat"] = None
+                    st.rerun()
+                if c_no.button("❌ No", use_container_width=True):
+                    st.session_state["ai_full_chat_consent"] = False
+                    st.session_state["ai_messages"].append({"role": "user", "content": awaiting["question"]})
+                    st.session_state["ai_messages"].append({
+                        "role": "assistant",
+                        "content": ("I cannot answer this question — it needs the **whole chat file** to be "
+                                    "processed, and I cannot proceed without your permission. "
+                                    "Ask me anything my normal tools can compute (counts, rankings, dates, "
+                                    "quotes, topics), or use **🔓 Allow full-chat questions** above if you "
+                                    "change your mind."),
+                        "trace": []})
+                    st.session_state["ai_awaiting_full_chat"] = None
+                    st.rerun()
+
         # -- input
         typed = st.chat_input("Ask a question about this chat…")
         question = (typed or st.session_state.pop("ai_pending", None) or "").strip()
@@ -381,11 +424,32 @@ if uploaded_file is not None:
                 with st.chat_message("user", avatar="🧑"):
                     st.markdown(question)
                 with st.chat_message("assistant", avatar="🤖"):
+                    prog = st.empty()
+                    consent = st.session_state.get("ai_full_chat_consent")
                     with st.spinner("Analysing the chat…"):
                         try:
-                            answer, trace = ChatAgent(tools, api_key=api_key).ask(question, history)
+                            answer, trace = ChatAgent(
+                                tools, api_key=api_key,
+                                allow_full_chat=consent is True,
+                                progress=lambda t: prog.caption(t),
+                            ).ask(question, history)
+                        except FullChatConsentRequired as e:
+                            prog.empty()
+                            if consent is None:
+                                # First time: don't answer — ask the user on the
+                                # dashboard and remember the question to re-run.
+                                st.session_state["ai_awaiting_full_chat"] = {
+                                    "question": question, "reason": e.reason}
+                                st.rerun()
+                            # The user already said No for this file.
+                            answer, trace = (
+                                "I cannot answer this question — it needs the **whole chat file** to be "
+                                "processed, and you chose not to share it. Ask me anything my normal tools "
+                                "can compute, or use **🔓 Allow full-chat questions** above to change your "
+                                "decision.", [])
                         except Exception as e:      # API / network / rate-limit -> friendly text, never a crash
                             answer, trace = friendly_api_error(e), []
+                    prog.empty()
             messages.append({"role": "user", "content": question})
             messages.append({"role": "assistant", "content": answer, "trace": trace})
             st.rerun()   # redraw everything from state so the new pair sits in the conversation flow
