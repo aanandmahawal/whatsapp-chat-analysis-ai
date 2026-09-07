@@ -168,6 +168,23 @@ class ChatAgent:
                 if recovered is None:
                     raise
                 name, args = recovered
+                if name == "request_full_chat":
+                    if not self.allow_full_chat:
+                        raise FullChatConsentRequired(str(args.get("reason") or ""))
+                    rid = f"recovered_{_round}"
+                    messages.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{"id": rid, "type": "function",
+                                        "function": {"name": name,
+                                                     "arguments": json.dumps(args)}}],
+                    })
+                    notes = self._read_full_chat(question)
+                    trace.append({"tool": name, "input": args,
+                                  "output": notes[:2000], "error": False,
+                                  "recovered": True})
+                    messages.append({"role": "tool", "tool_call_id": rid,
+                                     "name": name, "content": notes})
+                    return self._finish_from_notes(messages, notes, trace)
                 call_id = f"recovered_{_round}"
                 messages.append({
                     "role": "assistant", "content": "",
@@ -212,7 +229,7 @@ class ChatAgent:
                               "output": notes[:2000], "error": False})
                 messages.append({"role": "tool", "tool_call_id": fc.id,
                                  "name": "request_full_chat", "content": notes})
-                continue
+                return self._finish_from_notes(messages, notes, trace)
 
             # Record the assistant's tool request, then run every requested tool.
             messages.append({
@@ -246,6 +263,25 @@ class ChatAgent:
         if answer:
             answer += "\n\n(I reached my analysis-step limit; the answer above may be incomplete.)"
         return answer or "I ran out of analysis steps before finishing. Try a narrower question.", trace
+
+    # ------------------------------------------------------------------
+    def _finish_from_notes(self, messages, notes: str, trace) -> tuple:
+        """The full chat has been read — nothing is left to look up, so the
+        answer is written in ONE tool-free call (a text reply is the only
+        thing the model CAN produce; the malformed-tool-call failure mode is
+        structurally impossible). And because the user just waited minutes
+        for the reading, an API failure here must not throw that work away:
+        the extracted notes themselves become the answer of last resort."""
+        try:
+            response = self._call(messages, tool_choice="none")
+            answer = (response.choices[0].message.content or "").strip()
+            if answer:
+                return answer, trace
+        except (groq.APIStatusError, groq.APIConnectionError):
+            pass
+        cleaned = notes.split("\n", 1)[-1].strip()
+        return ("I read the whole chat, but the final summarisation call failed, "
+                "so here are the findings exactly as extracted:\n\n" + cleaned[:4000]), trace
 
     # ------------------------------------------------------------------
     def _read_full_chat(self, question: str) -> str:
@@ -338,9 +374,20 @@ def _recover_failed_tool_call(err) -> Optional[tuple]:
     e = body.get("error") or {}
     if e.get("code") != "tool_use_failed":
         return None
+    raw = e.get("failed_generation") or ""
     try:
-        gen = json.loads(e.get("failed_generation") or "")
+        gen = json.loads(raw)
     except (TypeError, ValueError):
+        # Models sometimes wrap the call in fences or prose; salvage the
+        # first JSON object that appears anywhere in the text.
+        m = re.search(r"\{.*\}", str(raw), re.S)
+        if not m:
+            return None
+        try:
+            gen = json.loads(m.group(0))
+        except ValueError:
+            return None
+    if not isinstance(gen, dict):
         return None
     name = gen.get("name")
     if name not in _TOOL_NAMES:
