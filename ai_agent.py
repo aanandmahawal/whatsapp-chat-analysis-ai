@@ -46,6 +46,7 @@ Chat: {n_users} participants ({users}); {first_date} to {last_date}; {total_mess
 Rules:
 - ALWAYS call a tool for any count, ranking, date, position (Nth/first/last), or quote. Never estimate or reuse stale results.
 - Routing: "summary / overview of this chat" -> get_topic_overview ONLY (it already includes totals); plain totals or "how many users" -> get_chat_statistics; rankings -> get_most_active_users; one user or comparing two -> get_user_statistics; "how many ... in March / on Sundays / 10PM-midnight" -> count_messages; Nth/first/last/second-last -> get_nth_message; list messages / on a date / longest -> get_messages; busiest day/hour/weekday -> get_activity_breakdown; exact word -> search_messages; topic/theme -> semantic_search (+ get_message_context); "what is this chat about / field / insights" -> get_topic_overview.
+- A question NO listed tool can compute — inferring something about every/many members from everything they wrote, overall style, "read the whole chat and ..." — -> request_full_chat. Never answer such questions from a few keyword searches; that under-reports.
 - Convert relative time ("last week", "in March") to concrete dates using today's date and the chat's range.
 - Names: pass as written; tools resolve partial names. If a tool says unknown/ambiguous, say so and list candidates. Write names exactly as in the chat.
 - Follow-ups: resolve "he/she/that user" from earlier turns.
@@ -71,6 +72,16 @@ def build_system_prompt(tools: ChatTools) -> str:
     )
 
 
+class FullChatConsentRequired(Exception):
+    """The model decided the question needs the WHOLE chat, and the user has
+    not (yet) given permission. The UI catches this, asks the user once, and —
+    on a Yes — re-asks the same question with allow_full_chat=True."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason or "this question requires reading the entire chat"
+
+
 class ChatAgent:
     def __init__(
         self,
@@ -79,12 +90,16 @@ class ChatAgent:
         model: str = config.GROQ_MODEL,
         max_tool_rounds: int = config.MAX_TOOL_ROUNDS,
         client: Optional[groq.Groq] = None,
+        allow_full_chat: bool = False,
+        progress=None,
     ):
         self.tools = tools
         self.model = model
         self.max_tool_rounds = max_tool_rounds
         self.client = client or groq.Groq(api_key=api_key)  # key is never logged or stored elsewhere
         self.system_prompt = build_system_prompt(tools)
+        self.allow_full_chat = allow_full_chat
+        self._progress = progress or (lambda text: None)
 
     # ------------------------------------------------------------------
     def _call(self, messages: list[dict], tool_choice: str):
@@ -176,6 +191,29 @@ class ChatAgent:
                 answer = (msg.content or "").strip()
                 return answer or "I couldn't produce an answer for that. Could you rephrase?", trace
 
+            # request_full_chat is not a normal tool: it is a PERMISSION
+            # boundary. Without consent it stops the run (the UI asks the
+            # user); with consent it triggers the chunked full-transcript
+            # reading pipeline, whose notes come back as the tool result.
+            fc = next((c for c in tool_calls if c.function.name == "request_full_chat"), None)
+            if fc is not None:
+                fc_args = _parse_args(fc.function.arguments) or {}
+                reason = str(fc_args.get("reason") or "").strip()
+                if not self.allow_full_chat:
+                    raise FullChatConsentRequired(reason)
+                messages.append({
+                    "role": "assistant", "content": msg.content or "",
+                    "tool_calls": [{"id": fc.id, "type": "function",
+                                    "function": {"name": "request_full_chat",
+                                                 "arguments": fc.function.arguments}}],
+                })
+                notes = self._read_full_chat(question)
+                trace.append({"tool": "request_full_chat", "input": {"reason": reason},
+                              "output": notes[:2000], "error": False})
+                messages.append({"role": "tool", "tool_call_id": fc.id,
+                                 "name": "request_full_chat", "content": notes})
+                continue
+
             # Record the assistant's tool request, then run every requested tool.
             messages.append({
                 "role": "assistant",
@@ -209,6 +247,83 @@ class ChatAgent:
             answer += "\n\n(I reached my analysis-step limit; the answer above may be incomplete.)"
         return answer or "I ran out of analysis steps before finishing. Try a narrower question.", trace
 
+    # ------------------------------------------------------------------
+    def _read_full_chat(self, question: str) -> str:
+        """User-consented full-transcript reading, sized for the free tier:
+        the chat is serialised, split into chunks, each chunk goes to the LLM
+        in its own call to extract question-relevant notes, and the combined
+        notes are returned as the tool result. Chats too long for the chunk
+        budget are sampled evenly and the notes say so."""
+        lines, last_day = [], None
+        for _, row in self.tools.df.iterrows():
+            if bool(row.get("is_notification")):
+                continue
+            day = None
+            try:
+                day = row["date"].date().isoformat()
+            except Exception:
+                pass
+            if day and day != last_day:
+                lines.append(f"== {day} ==")
+                last_day = day
+            text = str(row.get("message", ""))[: config.MAX_MESSAGE_CHARS]
+            lines.append(f"{row.get('user', '?')}: {text}")
+        transcript = "\n".join(lines)
+
+        size = config.FULL_CHAT_CHUNK_CHARS
+        chunks = [transcript[i:i + size] for i in range(0, len(transcript), size)] or [""]
+        sampled = ""
+        if len(chunks) > config.FULL_CHAT_MAX_CHUNKS:
+            step = len(chunks) / config.FULL_CHAT_MAX_CHUNKS
+            chunks = [chunks[int(i * step)] for i in range(config.FULL_CHAT_MAX_CHUNKS)]
+            sampled = (f" The chat was longer than the reading budget, so {len(chunks)} "
+                       "evenly spaced parts were read rather than every part.")
+
+        notes = []
+        for i, chunk in enumerate(chunks, 1):
+            self._progress(f"Reading the full chat… part {i} of {len(chunks)}")
+            reply = self._plain([
+                {"role": "system", "content":
+                    f"You are reading part {i} of {len(chunks)} of a WhatsApp chat transcript "
+                    f"to help answer this question:\n{question}\n"
+                    "Extract ONLY facts from this part that are relevant to the question, as short "
+                    "bullet notes that name the users involved. Quote at most a few words each. "
+                    "If nothing in this part is relevant, reply exactly: nothing"},
+                {"role": "user", "content": chunk},
+            ], max_out=config.FULL_CHAT_NOTE_TOKENS)
+            if reply and reply.strip().lower() != "nothing":
+                notes.append(f"[part {i}] {reply.strip()}")
+
+        body = "\n".join(notes) or "No relevant information was found anywhere in the chat."
+        body = body[: config.MAX_TOOL_RESULT_CHARS * 2]
+        return (f"Notes extracted from the FULL chat ({len(chunks)} parts read, "
+                f"with the user's permission).{sampled}\n{body}")
+
+    def _plain(self, messages: list[dict], max_out: int) -> str:
+        """One tool-free completion with patient 429 handling — full-chat mode
+        is slow by nature on the free tier and the user has already consented
+        to waiting, so refill waits up to FULL_CHAT_RETRY_WAIT_SECONDS."""
+        for attempt in range(3):
+            try:
+                r = self.client.chat.completions.create(
+                    model=self.model, messages=messages,
+                    temperature=config.TEMPERATURE, max_completion_tokens=max_out)
+                return r.choices[0].message.content or ""
+            except groq.RateLimitError as err:
+                wait = _retry_after_seconds(getattr(err, "message", str(err)))
+                if attempt < 2 and wait is not None and wait <= config.FULL_CHAT_RETRY_WAIT_SECONDS:
+                    time.sleep(wait + 0.5)
+                    continue
+                raise
+            except groq.APIStatusError as err:
+                if err.status_code == 413 and attempt < 2:
+                    # chunk plus prompt exceeded the per-minute budget: halve the chunk
+                    messages[-1]["content"] = messages[-1]["content"][: len(messages[-1]["content"]) // 2] \
+                        + "\n[truncated to fit the API limit]"
+                    continue
+                raise
+        return ""
+
 
 _TOOL_NAMES = {t["function"]["name"] for t in TOOL_SPECS}
 
@@ -236,6 +351,8 @@ def _recover_failed_tool_call(err) -> Optional[tuple]:
     if not isinstance(args, dict):
         args = {}
     return name, args
+
+
 
 
 def _parse_args(raw) -> Optional[dict]:
