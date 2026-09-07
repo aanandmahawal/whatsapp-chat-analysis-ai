@@ -29,7 +29,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Shown in the sidebar so you can confirm which build is running after an update.
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 # ---------------------------------------------------------------------------
 # Groq LLM
@@ -98,6 +98,20 @@ MAX_TOOL_RESULT_CHARS = _env_int("MAX_TOOL_RESULT_CHARS", 6000)
 # Default and maximum number of rows a list-type tool may return.
 DEFAULT_LIST_LIMIT = _env_int("DEFAULT_LIST_LIMIT", 15)
 MAX_LIST_LIMIT = _env_int("MAX_LIST_LIMIT", 100)
+
+# ---------------------------------------------------------------------------
+# Full-chat analysis (only ever runs after the user explicitly consents)
+# ---------------------------------------------------------------------------
+
+# The whole chat cannot fit in one free-tier request (8,000 tokens/minute), so
+# consented full-chat questions are answered map-reduce style: the transcript
+# is split into chunks, each chunk is sent in its own call to extract notes
+# relevant to the question, and a final call answers from the notes.
+FULL_CHAT_CHUNK_CHARS = _env_int("FULL_CHAT_CHUNK_CHARS", 18_000)   # ~4.5k tokens
+FULL_CHAT_MAX_CHUNKS = _env_int("FULL_CHAT_MAX_CHUNKS", 12)         # very long chats are sampled evenly
+FULL_CHAT_NOTE_TOKENS = _env_int("FULL_CHAT_NOTE_TOKENS", 400)      # notes budget per chunk
+# Between chunks the free-tier token bucket must refill; waits up to this long.
+FULL_CHAT_RETRY_WAIT_SECONDS = _env_int("FULL_CHAT_RETRY_WAIT_SECONDS", 75)
 
 # ---------------------------------------------------------------------------
 # Retrieval
