@@ -97,10 +97,18 @@ class ChatAgent:
         max_out = config.MAX_COMPLETION_TOKENS
 
         def create():
-            return self.client.chat.completions.create(
-                model=self.model, messages=messages, tools=TOOL_SPECS, tool_choice=tool_choice,
-                temperature=config.TEMPERATURE, max_completion_tokens=max_out,
-            )
+            kwargs = dict(model=self.model, messages=messages,
+                          temperature=config.TEMPERATURE,
+                          max_completion_tokens=max_out)
+            # "none" means: send NO tool catalogue at all. Groq's tool-capable
+            # models sometimes emit a tool call regardless of tool_choice, and
+            # tools-present + choice-none makes the API reject the whole
+            # generation (400 tool_use_failed: "Tool choice is none, but model
+            # called a tool"). With no tools listed there is nothing to
+            # mis-call — the model can only answer in text.
+            if tool_choice != "none":
+                kwargs.update(tools=TOOL_SPECS, tool_choice=tool_choice)
+            return self.client.chat.completions.create(**kwargs)
 
         for attempt in range(4):
             try:
@@ -132,16 +140,40 @@ class ChatAgent:
         )
         trace: list[dict] = []
 
-        for _round in range(self.max_tool_rounds + 1):
-            final_round = _round == self.max_tool_rounds
-            response = self._call(messages, tool_choice="none" if final_round else "auto")
+        for _round in range(self.max_tool_rounds):
+            try:
+                response = self._call(messages, tool_choice="auto")
+            except groq.BadRequestError as err:
+                # Groq occasionally rejects its OWN generation with 400
+                # tool_use_failed even in auto mode (malformed tool syntax).
+                # The rejection carries the call the model MEANT to make
+                # (failed_generation) — so instead of dying, run that tool
+                # ourselves, feed the result back, and carry on.
+                recovered = _recover_failed_tool_call(err)
+                if recovered is None:
+                    raise
+                name, args = recovered
+                call_id = f"recovered_{_round}"
+                messages.append({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": call_id, "type": "function",
+                                    "function": {"name": name,
+                                                 "arguments": json.dumps(args)}}],
+                })
+                output = run_tool(self.tools, name, args)
+                trace.append({"tool": name, "input": args,
+                              "output": output[:2000],
+                              "error": output.startswith('{"error"'),
+                              "recovered": True})
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "name": name, "content": output})
+                continue
+
             msg = response.choices[0].message
             tool_calls = msg.tool_calls or []
 
             if not tool_calls:
                 answer = (msg.content or "").strip()
-                if final_round and answer:
-                    answer += "\n\n(I reached my analysis-step limit; the answer above may be incomplete.)"
                 return answer or "I couldn't produce an answer for that. Could you rephrase?", trace
 
             # Record the assistant's tool request, then run every requested tool.
@@ -169,7 +201,41 @@ class ChatAgent:
                     "content": output,
                 })
 
-        return "I ran out of analysis steps before finishing. Try a narrower question.", trace
+        # Tool rounds exhausted: one last call with NO tools — the model must
+        # now answer in text from everything gathered above (see _call).
+        response = self._call(messages, tool_choice="none")
+        answer = (response.choices[0].message.content or "").strip()
+        if answer:
+            answer += "\n\n(I reached my analysis-step limit; the answer above may be incomplete.)"
+        return answer or "I ran out of analysis steps before finishing. Try a narrower question.", trace
+
+
+_TOOL_NAMES = {t["function"]["name"] for t in TOOL_SPECS}
+
+
+def _recover_failed_tool_call(err) -> Optional[tuple]:
+    """(tool_name, args) from a Groq 400 tool_use_failed, else None.
+    The error body looks like: {'error': {'code': 'tool_use_failed',
+    'failed_generation': '{"name": "search_messages", "arguments": {...}}'}}"""
+    body = getattr(err, "body", None)
+    if not isinstance(body, dict):
+        return None
+    e = body.get("error") or {}
+    if e.get("code") != "tool_use_failed":
+        return None
+    try:
+        gen = json.loads(e.get("failed_generation") or "")
+    except (TypeError, ValueError):
+        return None
+    name = gen.get("name")
+    if name not in _TOOL_NAMES:
+        return None
+    args = gen.get("arguments")
+    if isinstance(args, str):
+        args = _parse_args(args)
+    if not isinstance(args, dict):
+        args = {}
+    return name, args
 
 
 def _parse_args(raw) -> Optional[dict]:
@@ -250,6 +316,9 @@ def friendly_api_error(err: Exception) -> str:
         return f"The model '{config.GROQ_MODEL}' was not found. Set GROQ_MODEL to a model listed at console.groq.com/docs/models."
     if isinstance(err, groq.BadRequestError):
         detail = getattr(err, "message", None) or str(err)
+        if "tool_use_failed" in detail or "called a tool" in detail:
+            return ("The model stumbled mid-analysis and automatic recovery could not "
+                    "repair it this time. Please ask again — a slight rephrase usually works.")
         if "context" in detail.lower() or "token" in detail.lower():
             return "The request was too large for the model's context window. Try a narrower question or start a new conversation."
         return f"Groq rejected the request: {detail[:300]}"
