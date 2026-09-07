@@ -627,6 +627,29 @@ def _tool(name: str, description: str, properties: dict, required: Optional[list
 # Descriptions are deliberately short: every tool definition is re-sent on every API call,
 # and Groq's free tier allows only ~8k tokens per minute.
 TOOL_SPECS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "request_full_chat",
+            "description": (
+                "Ask the user for permission to read the ENTIRE chat. Call this ONLY when "
+                "no other tool can answer — e.g. inferring something about every/many members "
+                "from everything they wrote, overall writing-style questions, or anything that "
+                "genuinely requires reading all messages. Never call it for counts, rankings, "
+                "dates, quotes, keyword or topic questions — those have their own tools. "
+                "The system handles consent and, if granted, returns notes extracted from the "
+                "full transcript."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string",
+                               "description": "One sentence, shown to the user: why the full chat is needed."},
+                },
+                "required": ["reason"],
+            },
+        },
+    },
     _tool("get_chat_statistics",
           "Totals: messages, users+counts, words, media, links, date range, active days. For 'summary', "
           "'how many users/messages', or to check a name.",
